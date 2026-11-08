@@ -1,0 +1,239 @@
+<?xml version="1.0" encoding="UTF-8"?><sqlb_project><db path="cape_wholesale_ar_ap.db" readonly="0" foreign_keys="1" case_sensitive_like="0" temp_store="0" wal_autocheckpoint="1000" synchronous="2"/><attached/><window><main_tabs open="structure browser pragmas query" current="3"/></window><tab_structure><column_width id="0" width="300"/><column_width id="1" width="0"/><column_width id="2" width="100"/><column_width id="3" width="2065"/><column_width id="4" width="0"/><expanded_item id="0" parent="1"/><expanded_item id="1" parent="1"/><expanded_item id="2" parent="1"/><expanded_item id="3" parent="1"/></tab_structure><tab_browse><table title="customers" custom_title="0" dock_id="2" table="4,9:maincustomers"/><dock_state state="000000ff00000000fd00000001000000020000000000000000fc0100000002fb000000160064006f0063006b00420072006f00770073006500310100000000ffffffff0000000000000000fb000000160064006f0063006b00420072006f00770073006500320100000000ffffffff0000011800ffffff000000000000000000000004000000040000000800000008fc00000000"/><default_encoding codec=""/><browse_table_settings/></tab_browse><tab_sql><sql name="SQL 1*">-- =====================================================================
+-- PROJECT: Accounts Receivable &amp; Accounts Payable Analysis
+-- BUSINESS: Cape Wholesale Distributors (fictional) | CURRENCY: ZAR (R)
+-- AS-OF DATE: 31 Oct 2026
+-- TABLES: customers, suppliers, transactions
+-- NOTE: type = 'AR' means customer invoices, 'AP' means supplier bills
+--
+-- BUSINESS QUESTIONS ANSWERED IN THIS SCRIPT
+--   PART A: OVERALL POSITION
+--     Q1.  How much do customers owe us, and how much do we owe suppliers?
+--     Q2.  How much of the outstanding balance is overdue?
+--     Q3.  How old is the outstanding debt? (ageing)
+--     Q4.  How many days of sales and purchases are unpaid? (DSO / DPO)
+--     Q5.  Do we collect and pay within the agreed terms?
+--   PART B: ACCOUNTS RECEIVABLE (money customers owe us)
+--     Q6.  Which customers owe us the most 90+ days debt?
+--     Q7.  Which customers pay the latest compared with their terms?
+--     Q8.  Which customers owe more than their credit limit?
+--   PART C: ACCOUNTS PAYABLE (money we owe suppliers)
+--     Q9.  Which suppliers have the highest outstanding balances?
+--     Q10. Which suppliers do we owe overdue money to?
+--     Q11. When are supplier payments due?
+-- =====================================================================
+
+
+-- =====================================================================
+-- PART A: OVERALL POSITION (AR and AP)
+-- =====================================================================
+
+-- ---------------------------------------------------------------------
+-- Q1. How much do customers owe us, and how much do we owe suppliers?
+-- Logic: add up invoiced, paid and outstanding amounts for each type.
+-- ---------------------------------------------------------------------
+SELECT
+  type,                                  -- AR (customers) or AP (suppliers)
+  COUNT(*)              AS invoices,     -- how many invoices
+  SUM(invoice_amount)   AS total_invoiced,
+  SUM(amount_paid)      AS total_paid,
+  SUM(outstanding)      AS total_outstanding  -- money still owing
+FROM transactions
+GROUP BY type;                           -- one row for AR, one for AP
+
+
+-- ---------------------------------------------------------------------
+-- Q2. How much of the outstanding balance is overdue?
+-- Logic: keep only invoices that still have a balance AND are past due.
+-- ---------------------------------------------------------------------
+SELECT
+  type,
+  SUM(outstanding) AS overdue_balance
+FROM transactions
+WHERE outstanding &gt; 0                    -- money is still owing
+  AND days_overdue &gt; 0                   -- and the due date has passed
+GROUP BY type;
+
+
+-- ---------------------------------------------------------------------
+-- Q3. How old is the outstanding debt? (ageing report)
+-- Logic: group unpaid balances by ageing bucket, in time order.
+-- ---------------------------------------------------------------------
+SELECT
+  type,
+  ageing_bucket,
+  COUNT(*)         AS invoices,
+  SUM(outstanding) AS balance
+FROM transactions
+WHERE outstanding &gt; 0                    -- ignore fully paid invoices
+GROUP BY type, ageing_bucket
+ORDER BY
+  type,
+  CASE ageing_bucket                     -- sort by age, not alphabetically
+    WHEN 'Current'    THEN 1
+    WHEN '1-30 days'  THEN 2
+    WHEN '31-60 days' THEN 3
+    WHEN '61-90 days' THEN 4
+    WHEN '90+ days'   THEN 5
+  END;
+
+
+-- ---------------------------------------------------------------------
+-- Q4. How many days of sales (DSO) and purchases (DPO) are unpaid?
+-- Logic: outstanding / total invoiced x 365 days.
+-- 365.0 has a decimal so SQLite does not round the answer down.
+-- ---------------------------------------------------------------------
+SELECT
+  type,
+  ROUND(SUM(outstanding) * 365.0 / SUM(invoice_amount), 1) AS days_outstanding
+FROM transactions
+GROUP BY type;                           -- AR row = DSO, AP row = DPO
+
+
+-- ---------------------------------------------------------------------
+-- Q5. Do we collect and pay within the agreed terms?
+-- Logic: compare average terms with average days actually taken,
+-- using fully paid invoices only.
+-- ---------------------------------------------------------------------
+SELECT
+  type,
+  ROUND(AVG(terms_days), 1)   AS avg_terms,
+  ROUND(AVG(days_to_pay), 1)  AS avg_days_to_pay
+FROM transactions
+WHERE status = 'Paid'
+GROUP BY type;
+
+
+-- =====================================================================
+-- PART B: ACCOUNTS RECEIVABLE (customers)
+-- =====================================================================
+
+-- ---------------------------------------------------------------------
+-- Q6. Which customers owe us the most 90+ days debt?
+-- Logic: AR only, 90+ bucket, one row per customer, biggest first.
+-- ---------------------------------------------------------------------
+SELECT
+  party_name,                            -- the customer
+  COUNT(*)         AS invoices,
+  SUM(outstanding) AS balance_90_plus
+FROM transactions
+WHERE type = 'AR'                        -- customers only
+  AND ageing_bucket = '90+ days'         -- oldest debt only
+GROUP BY party_name                      -- one row per customer
+ORDER BY balance_90_plus DESC;           -- biggest debtor first
+
+
+-- ---------------------------------------------------------------------
+-- Q7. Which customers pay the latest compared with their credit terms?
+-- Logic: average days to pay minus terms = days late, paid AR only.
+-- Caution: customers who never paid are not in this average.
+-- ---------------------------------------------------------------------
+SELECT
+  party_name,
+  terms_days,                            -- agreed credit terms
+  ROUND(AVG(days_to_pay), 1)              AS avg_days_to_pay,
+  ROUND(AVG(days_to_pay) - terms_days, 1) AS days_late
+FROM transactions
+WHERE type = 'AR'
+  AND status = 'Paid'
+GROUP BY party_name, terms_days
+ORDER BY days_late DESC;                 -- latest payers first
+
+
+-- ---------------------------------------------------------------------
+-- Q8. Which customers owe more than their credit limit?
+-- Logic: join invoices to customers, total each customer's balance,
+-- and compare it with their credit limit.
+-- ---------------------------------------------------------------------
+SELECT
+  c.customer_name,
+  c.credit_limit,
+  SUM(t.outstanding) AS balance_owed,
+  ROUND(SUM(t.outstanding) * 100.0 / c.credit_limit, 0) AS pct_of_limit
+FROM customers c
+JOIN transactions t
+  ON t.party_id = c.customer_id          -- match each invoice to its customer
+WHERE t.type = 'AR'
+GROUP BY c.customer_id, c.customer_name, c.credit_limit
+ORDER BY pct_of_limit DESC;              -- most over-limit first
+
+
+-- =====================================================================
+-- PART C: ACCOUNTS PAYABLE (suppliers)
+-- =====================================================================
+
+-- ---------------------------------------------------------------------
+-- Q9. Which suppliers have the highest outstanding balances?
+-- Logic: AP only, unpaid balances, one row per supplier, biggest first.
+-- ---------------------------------------------------------------------
+SELECT
+  party_name,                            -- the supplier
+  COUNT(*)         AS invoices,
+  SUM(outstanding) AS balance_owed
+FROM transactions
+WHERE type = 'AP'                        -- supplier bills only
+  AND outstanding &gt; 0                    -- still unpaid
+GROUP BY party_name
+ORDER BY balance_owed DESC;
+
+
+-- ---------------------------------------------------------------------
+-- Q10. Which suppliers do we owe overdue money to?
+-- Logic: AP invoices past their due date that are still unpaid.
+-- ---------------------------------------------------------------------
+SELECT
+  party_name,
+  COUNT(*)         AS overdue_invoices,
+  SUM(outstanding) AS overdue_balance
+FROM transactions
+WHERE type = 'AP'
+  AND outstanding &gt; 0                    -- still unpaid
+  AND days_overdue &gt; 0                   -- past the due date
+GROUP BY party_name
+ORDER BY overdue_balance DESC;
+
+
+-- ---------------------------------------------------------------------
+-- Q11. When are supplier payments due?
+-- Logic: unpaid AP invoices not yet overdue, grouped by due month.
+-- strftime('%Y-%m', date) turns a date into year-month (SQLite).
+-- ---------------------------------------------------------------------
+SELECT
+  strftime('%Y-%m', due_date) AS due_month,
+  COUNT(*)                    AS invoices,
+  SUM(outstanding)            AS amount_due
+FROM transactions
+WHERE type = 'AP'
+  AND outstanding &gt; 0                    -- still unpaid
+  AND days_overdue = 0                   -- not yet overdue (due soon)
+GROUP BY due_month
+ORDER BY due_month;
+
+-- =====================================================================
+-- PART D: COMBINED WORKING CAPITAL (AR and AP together)
+-- =====================================================================
+
+-- ---------------------------------------------------------------------
+-- Q12. Are we collecting money faster than we pay suppliers,
+--      and what is the net outstanding position?
+-- Logic: split AR and AP totals into separate columns, then compare.
+-- Net position = AR - AP. It is NOT available cash.
+-- Cash gap = DSO - DPO (positive = we wait longer to be paid than
+-- suppliers wait for us).
+-- ---------------------------------------------------------------------
+SELECT
+  total_ar,
+  total_ap,
+  total_ar - total_ap  AS net_position,
+  dso,
+  dpo,
+  ROUND(dso - dpo, 1)  AS cash_gap_days
+FROM (
+  SELECT
+    SUM(CASE WHEN type = 'AR' THEN outstanding ELSE 0 END) AS total_ar,
+    SUM(CASE WHEN type = 'AP' THEN outstanding ELSE 0 END) AS total_ap,
+    ROUND(SUM(CASE WHEN type = 'AR' THEN outstanding ELSE 0 END) * 365.0
+        / SUM(CASE WHEN type = 'AR' THEN invoice_amount ELSE 0 END), 1) AS dso,
+    ROUND(SUM(CASE WHEN type = 'AP' THEN outstanding ELSE 0 END) * 365.0
+        / SUM(CASE WHEN type = 'AP' THEN invoice_amount ELSE 0 END), 1) AS dpo
+  FROM transactions
+);</sql><current_tab id="0"/></tab_sql></sqlb_project>
